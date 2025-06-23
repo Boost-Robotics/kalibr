@@ -78,5 +78,6 @@ catkin_install_python(
     python/kalibr_calibrate_imu_camera
     python/kalibr_create_target_pdf
     python/kalibr_calibrate_rs_cameras
+    python/kalibr_xarm6_capture
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

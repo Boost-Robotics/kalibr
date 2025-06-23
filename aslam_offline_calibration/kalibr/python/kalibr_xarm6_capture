@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+Kalibr xArm6 Image Capture Script
+
+This script controls an xArm6 robotic arm to move through predefined Cartesian 
+positions and capture images at each position. Designed for collecting calibration 
+data for camera-IMU calibration using Kalibr.
+
+Requirements:
+- xarm-python-sdk
+- opencv-python
+- numpy
+
+Usage:
+    kalibr_xarm6_capture --ip <robot_ip> --camera <camera_id>
+"""
+
+import rospy
+import rosbag
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import argparse
+import time
+import cv2
+import numpy as np
+import os
+from datetime import datetime
+from xarm.wrapper import XArmAPI
+import json
+
+
+class KalibrXArm6Capture:
+    def __init__(self, robot_ip, camera_id=0, output_dir="calibration_data"):
+        """
+        Initialize the xArm6 robot and camera for Kalibr data collection
+        
+        Args:
+            robot_ip (str): IP address of the xArm6 robot
+            camera_id (int): Camera device ID (default: 0)
+            output_dir (str): Directory to save captured images and ROS bag
+        """
+        self.robot_ip = robot_ip
+        self.camera_id = camera_id
+        self.output_dir = output_dir
+        self.bridge = CvBridge()
+        
+        # Initialize ROS node
+        rospy.init_node('kalibr_xarm6_capture', anonymous=True)
+        
+        # Initialize robot
+        print(f"Connecting to xArm6 at {robot_ip}...")
+        self.arm = XArmAPI(robot_ip)
+        
+        # Initialize camera
+        print(f"Initializing camera {camera_id}...")
+        self.cap = cv2.VideoCapture(camera_id)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {camera_id}")
+        
+        # Set camera properties for better image quality
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        # Create output directory structure
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "cam0"), exist_ok=True)
+        
+        # Robot configuration
+        self.setup_robot()
+        
+        # Define capture positions (x, y, z, roll, pitch, yaw) in mm and degrees
+        self.capture_positions = [
+            [300, 0, 400, 180, 0, 0],      # Front center
+            [300, -200, 400, 180, 0, 30],  # Front left
+            [300, 200, 400, 180, 0, -30],  # Front right
+            [200, -150, 500, 180, -20, 45], # High left
+            [200, 150, 500, 180, -20, -45], # High right
+            [400, 0, 300, 180, 20, 0],     # Low center
+            [350, -100, 350, 180, 10, 20], # Mid left
+            [350, 100, 350, 180, 10, -20], # Mid right
+            [250, 0, 450, 180, -10, 0],    # High center
+            [450, 0, 350, 180, 15, 0],     # Far center
+        ]
+        
+    def setup_robot(self):
+        """Setup robot parameters and initial state"""
+        print("Setting up robot...")
+        
+        # Connect and enable robot
+        self.arm.connect()
+        self.arm.motion_enable(enable=True)
+        self.arm.set_mode(0)  # Position mode
+        self.arm.set_state(state=0)  # Sport state
+        
+        # Set robot parameters
+        self.arm.set_tcp_jerk(1000)  # mm/s³
+        self.arm.set_tcp_maxacc(2000)  # mm/s²
+        
+        # Set collision sensitivity (optional)
+        self.arm.set_collision_sensitivity(3)
+        
+        # Wait for robot to be ready
+        time.sleep(2)
+        
+        print("Robot setup complete!")
+        
+    def move_to_position(self, position, speed=100, wait=True):
+        """
+        Move robot to specified Cartesian position
+        
+        Args:
+            position (list): [x, y, z, roll, pitch, yaw]
+            speed (int): Movement speed in mm/s
+            wait (bool): Wait for movement to complete
+        """
+        print(f"Moving to position: {position}")
+        
+        # Move to position
+        ret = self.arm.set_position(
+            x=position[0], y=position[1], z=position[2],
+            roll=position[3], pitch=position[4], yaw=position[5],
+            speed=speed, wait=wait
+        )
+        
+        if ret != 0:
+            print(f"Warning: Movement returned code {ret}")
+            
+        # Additional wait to ensure stability
+        if wait:
+            time.sleep(1.5)
+            
+    def capture_image_to_bag_and_file(self, bag, position_index):
+        """
+        Capture image at current position and save to both ROS bag and file
+        
+        Args:
+            bag: ROS bag object
+            position_index (int): Index of the current position
+            
+        Returns:
+            str: Filename of captured image
+        """
+        print(f"Capturing image at position {position_index + 1}")
+        
+        # Capture frame
+        ret, frame = self.cap.read()
+        if not ret:
+            raise RuntimeError("Failed to capture image")
+        
+        # Generate timestamp in nanoseconds (Kalibr format)
+        timestamp_ns = int(time.time() * 1e9)
+        timestamp = rospy.Time(nsecs=timestamp_ns)
+        
+        # Convert to grayscale for calibration (typical for Kalibr)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Save as PNG file with timestamp filename (Kalibr format)
+        filename = f"{timestamp_ns}.png"
+        filepath = os.path.join(self.output_dir, "cam0", filename)
+        cv2.imwrite(filepath, gray_frame)
+        
+        # Convert to ROS Image message and write to bag
+        try:
+            ros_image = self.bridge.cv2_to_imgmsg(gray_frame, "mono8")
+            ros_image.header.stamp = timestamp
+            ros_image.header.frame_id = "cam0"
+            bag.write("/cam0/image_raw", ros_image, timestamp)
+        except Exception as e:
+            print(f"Warning: Could not write to ROS bag: {e}")
+        
+        print(f"Image saved: {filepath}")
+        return filename
+        
+    def go_to_home_position(self):
+        """Move robot to home/safe position"""
+        print("Moving to home position...")
+        home_position = [300, 0, 500, 180, 0, 0]  # Safe position
+        self.move_to_position(home_position, speed=50)
+        
+    def run_capture_sequence(self, delay_between_positions=2.0, create_bag=True):
+        """
+        Run the complete image capture sequence
+        
+        Args:
+            delay_between_positions (float): Delay in seconds between positions
+            create_bag (bool): Whether to create a ROS bag file
+        """
+        print(f"Starting capture sequence with {len(self.capture_positions)} positions")
+        print(f"Data will be saved to: {self.output_dir}")
+        
+        # Store capture metadata
+        metadata = {
+            "robot_ip": self.robot_ip,
+            "camera_id": self.camera_id,
+            "timestamp": datetime.now().isoformat(),
+            "positions": [],
+            "images": []
+        }
+        
+        bag = None
+        try:
+            # Create ROS bag if requested
+            if create_bag:
+                bag_path = os.path.join(self.output_dir, "calibration_data.bag")
+                bag = rosbag.Bag(bag_path, 'w')
+                print(f"Creating ROS bag: {bag_path}")
+            
+            # Move to home position first
+            self.go_to_home_position()
+            
+            # Capture images at each position
+            for i, position in enumerate(self.capture_positions):
+                print(f"\n--- Position {i + 1}/{len(self.capture_positions)} ---")
+                
+                # Move to position
+                self.move_to_position(position)
+                
+                # Wait for stabilization
+                time.sleep(delay_between_positions)
+                
+                # Capture image
+                if bag is not None:
+                    image_filename = self.capture_image_to_bag_and_file(bag, i)
+                else:
+                    image_filename = self.capture_image_file_only(i)
+                
+                # Store metadata
+                metadata["positions"].append(position)
+                metadata["images"].append(image_filename)
+                
+                print(f"Position {i + 1} complete")
+                
+            # Return to home position
+            self.go_to_home_position()
+            
+            # Save metadata
+            metadata_file = os.path.join(self.output_dir, "capture_metadata.json")
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f"\nCapture sequence complete!")
+            print(f"Captured {len(self.capture_positions)} images")
+            print(f"Images saved to: {os.path.join(self.output_dir, 'cam0')}")
+            if create_bag:
+                print(f"ROS bag saved to: {os.path.join(self.output_dir, 'calibration_data.bag')}")
+            print(f"Metadata saved to: {metadata_file}")
+            
+        except Exception as e:
+            print(f"Error during capture sequence: {e}")
+            # Try to return to home position
+            try:
+                self.go_to_home_position()
+            except:
+                print("Warning: Could not return to home position")
+            raise
+        finally:
+            if bag is not None:
+                bag.close()
+                
+    def capture_image_file_only(self, position_index):
+        """Capture image to file only (no ROS bag)"""
+        print(f"Capturing image at position {position_index + 1}")
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            raise RuntimeError("Failed to capture image")
+        
+        timestamp_ns = int(time.time() * 1e9)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        filename = f"{timestamp_ns}.png"
+        filepath = os.path.join(self.output_dir, "cam0", filename)
+        cv2.imwrite(filepath, gray_frame)
+        
+        print(f"Image saved: {filepath}")
+        return filename
+            
+    def preview_camera(self, duration=10):
+        """
+        Preview camera feed for specified duration
+        
+        Args:
+            duration (int): Preview duration in seconds
+        """
+        print(f"Previewing camera for {duration} seconds...")
+        print("Press 'q' to quit early")
+        
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            ret, frame = self.cap.read()
+            if ret:
+                cv2.imshow('Camera Preview', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        
+        cv2.destroyAllWindows()
+        
+    def cleanup(self):
+        """Clean up resources"""
+        print("Cleaning up...")
+        
+        # Release camera
+        if hasattr(self, 'cap'):
+            self.cap.release()
+            
+        # Disconnect robot
+        if hasattr(self, 'arm'):
+            try:
+                self.arm.disconnect()
+            except:
+                pass
+                
+        cv2.destroyAllWindows()
+        print("Cleanup complete")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Kalibr xArm6 Image Capture for Camera Calibration')
+    parser.add_argument('--ip', required=True, help='xArm6 robot IP address')
+    parser.add_argument('--camera', type=int, default=0, help='Camera device ID (default: 0)')
+    parser.add_argument('--output', default='calibration_data', help='Output directory for data')
+    parser.add_argument('--preview', action='store_true', help='Preview camera before capture')
+    parser.add_argument('--delay', type=float, default=2.0, help='Delay between positions (seconds)')
+    parser.add_argument('--no-bag', action='store_true', help='Do not create ROS bag file')
+    
+    args = parser.parse_args()
+    
+    capture_system = None
+    try:
+        # Initialize system
+        capture_system = KalibrXArm6Capture(
+            robot_ip=args.ip,
+            camera_id=args.camera,
+            output_dir=args.output
+        )
+        
+        # Preview camera if requested
+        if args.preview:
+            capture_system.preview_camera()
+            
+        # Run capture sequence
+        capture_system.run_capture_sequence(
+            delay_between_positions=args.delay,
+            create_bag=not args.no_bag
+        )
+        
+    except KeyboardInterrupt:
+        print("\nCapture interrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if capture_system:
+            capture_system.cleanup()
+
+
+if __name__ == "__main__":
+    main() 
